@@ -1,0 +1,29 @@
+# S3连接配置
+s3:
+  endpoint: http://localhost:9000
+  access_key: your-access-key
+  secret_key: your-secret-key
+  bucket: sync-bucket
+  region: us-east-1
+  use_ssl: false
+  verify_ssl: false
+
+# 同步配置
+sync:
+  max_concurrent: 3              # 最大并发传输数
+  chunk_size: 8388608            # 分片大小(8MB)
+  retry_times: 3                 # 重试次数
+  retry_delay: 5                 # 重试延迟(秒)
+  conflict_strategy: rename      # 冲突策略: rename/overwrite/skip
+  sync_mode: bidirectional       # 同步模式: bidirectional/upload/download
+
+# 定时任务
+tasks: []
+
+# 应用设置
+app:
+  auto_start: false              # 开机自启动
+  minimize_to_tray: true         # 最小化到托盘
+  log_level: INFO                # 日志级别: DEBUG/INFO/WARNING/ERROR
+  log_file: logs/sync.log        # 日志文件路径
+  language: zh_CN                # 界面语言
