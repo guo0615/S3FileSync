@@ -8,6 +8,8 @@ import threading
 import logging
 from typing import Dict, Optional, Callable, Set, List
 
+from ..models.sync_task import SyncMode
+
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -287,12 +289,32 @@ class FileWatcher:
                     self._sync_task(task, rel_paths, rel_deleted)
 
     def _sync_task(self, task, rel_paths, rel_deleted=None):
-        """实时同步单个任务：上传本地变更 + 删除远程对应文件"""
+        """实时同步单个任务
+
+        按任务的同步模式决定行为：
+        - DOWNLOAD（仅下载）：本地变更不触发任何写远程操作，
+          不做上传也不删除远程（远程→本地由定时/手动同步完成）。
+        - UPLOAD（仅上传）：上传本地新增/修改 + 传播删除（本地删除 -> 删远程）。
+        - BIDIRECTIONAL（双向）：上传本地变更 + 删除远程对应文件。
+
+        需与 _on_files_changed 的监听范围配合：DOWNLOAD 任务在
+        add_watch 时即跳过监听，此处双重保险。
+        """
         if not self._sync_lock.acquire(blocking=False):
             self.logger.debug("已有实时同步进行中，跳过本次触发")
             return
 
         rel_deleted = rel_deleted or []
+
+        # 仅下载模式：本地文件监听不应产生任何写远程操作（不传、不删）
+        if getattr(task, "sync_mode", None) == SyncMode.DOWNLOAD:
+            self.logger.debug(
+                f"任务为仅下载模式，跳过本地变更实时同步: {getattr(task, 'name', '')} "
+                f"(变更{len(rel_paths)}个, 删除{len(rel_deleted)}个)"
+            )
+            self._sync_lock.release()
+            return
+
         try:
             local_path = task.local_path
             remote_prefix = task.remote_prefix or ""
@@ -305,6 +327,7 @@ class FileWatcher:
             s3_client = self.sync_engine.s3_client
 
             # 1. 处理删除：本地文件被删 -> 删除远程对应对象
+            #    仅上传/双向模式均传播删除（仅下载模式在此前已提前 return）
             for rel in rel_deleted:
                 remote_key = FileUtils.normalize_path(os.path.join(remote_prefix, rel))
                 try:

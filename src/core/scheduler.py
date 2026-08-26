@@ -14,7 +14,7 @@ from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 
 from .sync_engine import SyncEngine
 from .file_watcher import FileWatcher, watchdog_available
-from ..models.sync_task import SyncTask
+from ..models.sync_task import SyncTask, SyncMode
 from ..models.transfer_state import TransferStatus
 
 
@@ -69,6 +69,15 @@ class SyncScheduler:
         self._scheduler.start()
         self.logger.info("调度器已启动")
 
+    @staticmethod
+    def _supports_realtime_upload(sync_mode) -> bool:
+        """该同步模式是否包含"本地→远程"的实时上传方向
+
+        仅下载(download)模式不监听本地目录：本地变更不应实时上传到远程。
+        双向(bidirectional)与仅上传(upload)模式才会监听本地并实时同步。
+        """
+        return sync_mode != SyncMode.DOWNLOAD
+
     def set_realtime_watch(self, enabled: bool):
         """
         启用/禁用本地文件实时监听
@@ -82,8 +91,11 @@ class SyncScheduler:
             self._watch_enabled = enabled
 
             if enabled:
+                # 仅监听"本地变更会上传到远程"的任务（双向/仅上传）。
+                # 仅下载任务不监听本地目录：本地文件变化不应实时上传到远程，
+                # 否则"仅下载"任务会被实时监听反向实时上传（Bug）。
                 for task in self._tasks.values():
-                    if task.enabled:
+                    if task.enabled and self._supports_realtime_upload(task.sync_mode):
                         self.file_watcher.add_watch(task)
                 self.logger.info("已启用本地文件实时监听")
             else:
@@ -122,8 +134,8 @@ class SyncScheduler:
             if task.enabled:
                 self._schedule_task(task)
 
-            # 实时监听：若全局监听已开启且任务启用，则开始监听本地目录
-            if self._watch_enabled and task.enabled:
+            # 实时监听：若全局监听已开启且任务启用且模式含"上传"方向，则开始监听本地目录
+            if self._watch_enabled and task.enabled and self._supports_realtime_upload(task.sync_mode):
                 self.file_watcher.add_watch(task)
 
             self.logger.info(f"添加任务: {task.name} ({task.id})")
@@ -232,8 +244,8 @@ class SyncScheduler:
                 task = self._tasks[task_id]
                 self._schedule_task(task)
 
-            # 恢复实时监听
-            if self._watch_enabled:
+            # 恢复实时监听（仅含"上传"方向的任务；仅下载任务不需要监听本地）
+            if self._watch_enabled and self._supports_realtime_upload(self._tasks[task_id].sync_mode):
                 self.file_watcher.add_watch(self._tasks[task_id])
 
             # 更新状态
@@ -339,8 +351,8 @@ class SyncScheduler:
             if task.enabled:
                 self._schedule_task(task)
 
-            # 重新监听（若全局监听开启）
-            if self._watch_enabled and task.enabled:
+            # 重新监听（若全局监听开启且模式含"上传"方向）
+            if self._watch_enabled and task.enabled and self._supports_realtime_upload(task.sync_mode):
                 self.file_watcher.add_watch(task)
 
             self.logger.info(f"更新任务: {task.name} ({task.id})")
