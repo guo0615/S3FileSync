@@ -1,0 +1,18 @@
+# 统一行尾：仓库内一律以 LF 存储，避免同一文件因 CRLF/LF 差异产生"整文件重写"的假 diff
+# （工作区用哪种行尾由编辑器/系统决定，git 在入库时统一归一化为 LF）
+* text=auto eol=lf
+
+# 二进制文件：不做任何行尾转换，避免损坏
+*.pyc binary
+*.pyo binary
+*.pkg binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
