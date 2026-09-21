@@ -93,18 +93,31 @@ class HashUtils:
         """
         计算S3 ETag(模拟AWS S3的分片上传ETag计算方式)
 
+        用于让本地文件的"内容指纹"与远端 list_objects_v2 返回的 ETag 直接可比，
+        无需额外请求即可判断内容是否一致（见 sync_engine.scan_local）。
+
+        注意：计算口径必须与实际上传方式严格一致，否则本地指纹与远端 ETag
+        对不上，大文件每次都会退化到按修改时间比较：
+        - 小于等于分片大小：S3 单次 PUT，ETag = 整个文件的 MD5；
+        - 大于分片大小：S3 分片上传，ETag = 各分片 MD5 拼接后再取 MD5，形如 "<md5>-<分片数>"。
+        因此这里的分片阈值必须与 S3Client.upload_file 走分片上传的阈值
+        （8MB）以及 TransferManager.chunk_size 默认值保持一致。
+
         Args:
             file_path: 文件路径
-            chunk_size: 分片大小(默认8MB)
+            chunk_size: 分片大小(默认8MB，与上传分片大小一致)
 
         Returns:
-            ETag值
+            ETag值（不含引号），失败时返回空字符串
         """
         import os
 
-        file_size = os.path.getsize(file_path)
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            return ""
 
-        # 如果文件小于分片大小，直接计算MD5
+        # 与 S3Client.upload_file 的分片阈值一致：<= 8MB 走单次上传，ETag = 整文件 MD5
         if file_size <= chunk_size:
             return HashUtils.calculate_file_md5(file_path)
 

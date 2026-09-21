@@ -229,11 +229,15 @@ class SyncEngine:
                     rel_path = FileUtils.normalize_path(rel_path)
 
                     # 获取文件信息（mtime 使用 UTC 墙钟时间口径，与远程 S3 服务器时间一致）
+                    # hash 用 ETag 口径（<=8MB 为整文件 MD5，>8MB 为分片 MD5 拼接后再 MD5），
+                    # 与远端 list_objects_v2 返回的 ETag 同构，可直接比较判断内容是否一致；
+                    # 若用普通 MD5，大文件指纹与远端 ETag 结构不同、永远对不上，
+                    # 会退化为按修改时间比较而反复传输。
                     file_info = FileInfo(
                         path=rel_path,
                         size=FileUtils.get_file_size(file_path),
                         mtime=FileUtils.get_file_mtime_utc(file_path),
-                        hash=HashUtils.calculate_file_md5(file_path),
+                        hash=HashUtils.calculate_etag(file_path),
                         is_dir=False
                     )
                     files[rel_path] = file_info
@@ -875,11 +879,12 @@ class SyncEngine:
         remote_file: FileInfo
     ) -> bool:
         """处理冲突：覆盖"""
-        if local_file.mtime > remote_file.mtime:
+        # 复用 _mtime_newer 做容错比较（任一侧 mtime 为 None 时不会抛 TypeError）
+        if self._mtime_newer(local_file.mtime, remote_file.mtime):
             # 本地较新，上传覆盖远程
             return self._execute_upload(task, local_file)
         else:
-            # 远程较新，下载覆盖本地
+            # 远程较新（或时间相同/缺失），下载覆盖本地
             return self._execute_download(task, remote_file)
 
     def get_sync_history(self) -> Dict[str, FileInfo]:

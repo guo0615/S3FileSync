@@ -3,17 +3,52 @@ S3客户端模块
 封装boto3 S3操作，提供统一的文件传输接口
 """
 import os
+import mimetypes
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from botocore.client import Config
 from typing import List, Optional, Dict, Any, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from ..utils.config_manager import S3Config
 from ..models.file_info import FileInfo
 from ..utils.hash_utils import HashUtils
 from ..utils.file_utils import FileUtils
+
+
+# 自定义元数据键：把本地修改时间(MD5)随对象一起保存，
+# 使远端扫描无需额外请求即可拿到精确的源文件 mtime（list_objects_v2 会返回 Metadata）。
+# 单词间用连字符，与其他 x-amz-meta-* 命名习惯一致（读取时对 - / _ 做归一化）。
+META_MTIME_NS = "mtime-ns"
+META_MD5 = "md5"
+
+# 上传走分片上传的文件大小阈值。必须与 HashUtils.calculate_etag 默认 chunk_size
+# 和 TransferManager.chunk_size 默认值保持一致(8MB)，否则大文件本地指纹与远端 ETag 无法对齐。
+MULTIPART_THRESHOLD = 8 * 1024 * 1024  # 8MB
+
+
+def utc_ns_to_datetime(ns: int) -> Optional[datetime]:
+    """把 UTC 纳秒时间戳转换为 naive datetime（UTC 墙钟口径）
+
+    与 FileUtils.get_file_mtime_utc / S3 LastModified 使用同一时间基准。
+    """
+    try:
+        return datetime.fromtimestamp(int(ns) / 1_000_000_000, tz=timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def datetime_to_utc_ns(dt: datetime) -> Optional[int]:
+    """把 naive(UTC 墙钟) 或 aware datetime 转换为 UTC 纳秒时间戳字符串"""
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1_000_000_000)
+    except (ValueError, OSError):
+        return None
 
 
 class S3Client:
@@ -167,6 +202,36 @@ class S3Client:
             return dt.replace(tzinfo=None)
         return dt
 
+    @staticmethod
+    def _meta_get(metadata: Optional[Dict[str, str]], key: str) -> Optional[str]:
+        """大小写不敏感地取自定义元数据值（S3 元数据键大小写规则不一）
+
+        同时对 - 与 _ 做归一化：不同 S3 兼容服务端可能把用户元数据键的
+        连字符/下划线互换，统一按等价处理，避免读取时静默落空。
+        """
+        if not metadata:
+            return None
+        norm = key.lower().replace('-', '_')
+        for k, v in metadata.items():
+            if k.lower().replace('-', '_') == norm:
+                return v
+        return None
+
+    @classmethod
+    def _mtime_from_object(cls, metadata: Optional[Dict[str, str]], last_modified) -> datetime:
+        """取对象的源文件修改时间：优先自定义元数据 mtime，缺失时回退 LastModified
+
+        上传时写入了 x-amz-meta-mtime-ns（源文件真实修改时间），远端扫描据此
+        得到"文件本身的修改时间"而非"上传时刻"，两侧时间基准一致，避免
+        每轮同步都误判远端更新而反复传输。
+        """
+        raw = cls._meta_get(metadata, META_MTIME_NS)
+        if raw:
+            dt = utc_ns_to_datetime(raw)
+            if dt is not None:
+                return dt
+        return cls._to_local_naive(last_modified)
+
     def list_files(self, prefix: str = '', delimiter: str = '/') -> List[FileInfo]:
         """
         列出远程文件（单层，含子目录占位）
@@ -199,13 +264,14 @@ class S3Client:
             for page in page_iterator:
                 # 处理文件
                 for obj in page.get('Contents', []):
+                    metadata = obj.get('Metadata', {}) or {}
                     file_info = FileInfo(
                         path=obj['Key'],
                         size=obj['Size'],
-                        mtime=self._to_local_naive(obj['LastModified']),
+                        mtime=self._mtime_from_object(metadata, obj['LastModified']),
                         hash=obj.get('ETag', '').strip('"'),
                         is_dir=False,
-                        metadata=obj.get('Metadata', {})
+                        metadata=metadata
                     )
                     files.append(file_info)
 
@@ -259,13 +325,14 @@ class S3Client:
             for page in page_iterator:
                 # 处理文件
                 for obj in page.get('Contents', []):
+                    metadata = obj.get('Metadata', {}) or {}
                     file_info = FileInfo(
                         path=obj['Key'],
                         size=obj['Size'],
-                        mtime=self._to_local_naive(obj['LastModified']),
+                        mtime=self._mtime_from_object(metadata, obj['LastModified']),
                         hash=obj.get('ETag', '').strip('"'),
                         is_dir=False,
-                        metadata=obj.get('Metadata', {})
+                        metadata=metadata
                     )
                     files.append(file_info)
 
@@ -298,31 +365,113 @@ class S3Client:
         """
         上传文件
 
+        上传时会自动附带源文件的修改时间与内容 MD5 到自定义元数据
+        （x-amz-meta-mtime-ns / x-amz-meta-md5），并在上传成功后把对象的
+        LastModified 回写为源文件真实修改时间。这样远端保存的是"文件本身的
+        时间"而非"上传时刻"，两侧时间基准一致，后续同步不会因为远端时间
+        永远较新而反复下载/上传。
+
         Args:
             local_path: 本地文件路径
             remote_key: 远程键
             callback: 进度回调函数 callback(transferred, total)
-            metadata: 元数据
+            metadata: 额外元数据（会与自动元数据合并，同键以调用方为准）
 
         Returns:
             是否成功
         """
+        ok = False
         try:
             file_size = os.path.getsize(local_path)
-            extra_args = {}
 
+            # 自动元数据：源文件 mtime(纳秒) + 内容 MD5，随对象保存
+            auto_meta: Dict[str, str] = {}
+            try:
+                mtime_ns = datetime_to_utc_ns(
+                    FileUtils.get_file_mtime_utc(local_path))
+                if mtime_ns is not None:
+                    auto_meta[META_MTIME_NS] = str(mtime_ns)
+                md5 = HashUtils.calculate_file_md5(local_path)
+                if md5:
+                    auto_meta[META_MD5] = md5
+            except Exception as e:
+                self.logger.debug(f"计算上传元数据失败(忽略): {local_path}, {e}")
+
+            extra_args: Dict[str, Any] = {}
+            merged_meta = dict(auto_meta)
             if metadata:
-                extra_args['Metadata'] = metadata
+                merged_meta.update(metadata)
+            if merged_meta:
+                extra_args['Metadata'] = merged_meta
 
             # 使用分片上传以支持大文件和进度回调
-            if file_size > 8 * 1024 * 1024:  # 大于8MB使用分片上传
-                return self._upload_multipart(local_path, remote_key, callback, extra_args)
+            if file_size > MULTIPART_THRESHOLD:
+                ok = self._upload_multipart(local_path, remote_key, callback, extra_args)
             else:
-                return self._upload_simple(local_path, remote_key, callback, extra_args)
+                ok = self._upload_simple(local_path, remote_key, callback, extra_args)
+
+            # 上传成功后回写远端 LastModified 为源文件修改时间（MinIO/S3 兼容
+            # copy_object：用源对象自身作为复制源 + MetadataDirective=REPLACE）。
+            if ok:
+                self._apply_remote_mtime(remote_key, merged_meta)
+
+            return ok
 
         except Exception as e:
             self.logger.error(f"上传文件失败: {local_path} -> {remote_key}, {e}")
             self._record_error("upload", f"{local_path} -> {remote_key}", e)
+            return False
+
+    def _apply_remote_mtime(self, remote_key: str, metadata: Optional[Dict[str, str]] = None) -> bool:
+        """把远端对象的 LastModified 回写为其元数据记录的源文件 mtime
+
+        用源对象自身作为复制源、MetadataDirective=REPLACE 重建对象，从而让
+        LastModified 变为源文件真实修改时间（S3/MinIO 的 copy_object 默认把
+        LastModified 置为复制时刻，无法直接指定）。metadata 取上传时写入的那份，
+        避免额外 head_object。这是尽力而为的操作：失败只记 debug 日志，不影响上传结果。
+        """
+        if metadata is None:
+            try:
+                response = self._client.head_object(
+                    Bucket=self.config.bucket,
+                    Key=remote_key
+                )
+                metadata = response.get('Metadata', {}) or {}
+            except Exception as e:
+                self.logger.debug(f"回写远端时间失败(head): {remote_key}, {e}")
+                return False
+
+        mtime_ns_raw = self._meta_get(metadata, META_MTIME_NS)
+        target_dt = utc_ns_to_datetime(mtime_ns_raw) if mtime_ns_raw else None
+
+        if target_dt is None:
+            # 元数据里没有 mtime_ns（如旧版本上传的对象）：
+            # 没有精确目标时间可写，跳过以省去一次无意义的复制请求。
+            self.logger.debug(f"对象无 mtime_ns 元数据，跳过回写: {remote_key}")
+            return False
+
+        copy_source = {'Bucket': self.config.bucket, 'Key': remote_key}
+        try:
+            # MetadataDirective=REPLACE 会丢弃原对象的其他头（ContentType、
+            # ContentEncoding、CacheControl 等，上传时由 boto3 自动推断）。
+            # 这里按扩展名重新带上 ContentType，避免自复制后类型被重置为
+            # binary/octet-stream。
+            extra: Dict[str, Any] = {}
+            guessed = mimetypes.guess_type(remote_key)[0]
+            if guessed:
+                extra['ContentType'] = guessed
+            self._client.copy_object(
+                Bucket=self.config.bucket,
+                Key=remote_key,
+                CopySource=copy_source,
+                Metadata=metadata,
+                MetadataDirective='REPLACE',
+                **extra,
+            )
+            self.logger.debug(f"远端时间已回写: {remote_key} -> {target_dt.isoformat()}")
+            return True
+        except Exception as e:
+            self.logger.debug(f"回写远端时间失败(copy): {remote_key}, {e}")
             return False
 
     @staticmethod
@@ -416,22 +565,55 @@ class S3Client:
             if local_dir:
                 os.makedirs(local_dir, exist_ok=True)
 
-            # 获取文件大小
+            # 获取文件大小（同时拿到元数据，用于下载后还原本地 mtime）
             response = self._client.head_object(
                 Bucket=self.config.bucket,
                 Key=remote_key
             )
             file_size = response['ContentLength']
+            remote_meta = response.get('Metadata', {}) or {}
 
             # 大文件使用分片下载
-            if file_size > 8 * 1024 * 1024:
-                return self._download_multipart(remote_key, local_path, callback)
+            if file_size > MULTIPART_THRESHOLD:
+                ok = self._download_multipart(remote_key, local_path, callback)
             else:
-                return self._download_simple(remote_key, local_path, callback, file_size)
+                ok = self._download_simple(remote_key, local_path, callback, file_size)
+
+            # 下载成功后把本地 mtime 还原为源文件修改时间（元数据优先，回退 LastModified），
+            # 保证两侧时间基准一致，下一轮同步不会误判为"本地已修改"。
+            if ok:
+                self._apply_local_mtime(local_path, remote_meta, response.get('LastModified'))
+
+            return ok
 
         except Exception as e:
             self.logger.error(f"下载文件失败: {remote_key} -> {local_path}, {e}")
             self._record_error("download", f"{remote_key} -> {local_path}", e)
+            return False
+
+    def _apply_local_mtime(
+        self,
+        local_path: str,
+        metadata: Optional[Dict[str, str]],
+        last_modified
+    ) -> bool:
+        """下载完成后把本地文件 mtime 设置为源文件修改时间
+
+        优先用对象元数据里的 mtime_ns；缺失时回退到对象 LastModified。
+        仅为尽力而为的操作，失败只记 debug 日志，不影响下载结果。
+        """
+        target = self._mtime_from_object(metadata, last_modified)
+        if target is None:
+            return False
+        ns = datetime_to_utc_ns(target)
+        if ns is None:
+            return False
+        try:
+            os.utime(local_path, ns=(ns, ns))
+            self.logger.debug(f"本地 mtime 已还原: {local_path} -> {target.isoformat()}")
+            return True
+        except Exception as e:
+            self.logger.debug(f"还原本地 mtime 失败: {local_path}, {e}")
             return False
 
     def _download_simple(
