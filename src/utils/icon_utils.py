@@ -173,6 +173,45 @@ def _get_file_type(file_name: str, is_dir: bool = False) -> str:
     return _EXT_MAP.get(ext, 'text')
 
 
+# 文件类型分组在"按类型排序"时的先后顺序（越小越靠前）
+_TYPE_ORDER = {
+    'folder': 0,
+    'text': 1,
+    'code': 2,
+    'image': 3,
+    'audio': 4,
+    'video': 5,
+    'pdf': 6,
+    'word': 7,
+    'excel': 8,
+    'ppt': 9,
+    'archive': 10,
+    'database': 11,
+    'executable': 12,
+}
+
+
+def get_file_type_sort_key(file_name: str, is_dir: bool = False):
+    """
+    按文件类型排序用的复合键：先按类型分组，组内再按名称（不区分大小写）。
+
+    与 get_file_icon 使用同一套类型分组（_get_file_type），保证"图标种类"
+    与"排序分组"一致。类型未知时排在已知类型之后，但仍按名称有序。
+
+    Args:
+        file_name: 文件名或路径
+        is_dir: 是否为文件夹
+
+    Returns:
+        (类型序号, 名称小写) 元组，可直接作为 sort 的 key
+    """
+    file_type = _get_file_type(file_name, is_dir)
+    order = _TYPE_ORDER.get(file_type, len(_TYPE_ORDER))
+    # 用 basename 排序，避免路径中的目录名干扰
+    name = os.path.basename(str(file_name)).lower()
+    return (order, name)
+
+
 def is_qtawesome_available() -> bool:
     """检查 qtawesome 是否可用"""
     return _QTAVAILABLE

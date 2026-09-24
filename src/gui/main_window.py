@@ -588,7 +588,7 @@ class MainWindow(QMainWindow):
         self.realtime_sync_failed.emit(payload)
 
     def _handle_realtime_sync_failed(self, failures_json: str):
-        """实时同步失败的 GUI 线程处理：弹出对话框展示失败文件清单"""
+        """实时同步失败的 GUI 线程处理：仅记录日志（不再弹窗）"""
         import json
         failures = []
         if failures_json:
@@ -600,7 +600,7 @@ class MainWindow(QMainWindow):
         if not failures:
             return
 
-        # 复用主窗口的失败文件弹窗
+        # 需求：同步报错不再弹窗打扰，明细写入日志即可
         self._show_failed_files_dialog(
             title="实时同步失败",
             intro=f"共 {len(failures)} 个文件实时同步失败",
@@ -1044,7 +1044,7 @@ class MainWindow(QMainWindow):
             if self.scheduler and getattr(self, "_manual_sync_task_id", None):
                 self.scheduler.finish_task(self._manual_sync_task_id)
                 self._manual_sync_task_id = None
-            QMessageBox.critical(self, "错误", error_msg)
+            self.statusBar().showMessage("启动同步失败，详见日志", 5000)
 
     def _on_sync_progress(self, message: str, current: int, total: int,
                           transferred_bytes: float = 0.0,
@@ -1122,14 +1122,15 @@ class MainWindow(QMainWindow):
                 failed_files = []
 
         if failed_files:
+            # 需求：同步报错不弹窗，仅记录日志（状态栏已在上方给出简短提示）
             self._show_failed_files_dialog(
                 title="部分文件同步失败",
                 intro=f"共 {len(failed_files)} 个文件同步失败，摘要: {message}",
                 failed_files=failed_files,
             )
         elif not success and not is_cancelled:
-            # 整体失败（异常），但无具体失败文件时，直接弹窗显示错误消息
-            QMessageBox.warning(self, "同步失败", message)
+            # 整体失败（异常），但无具体失败文件：仅记日志，不再弹窗
+            self.logger.error(f"同步失败: {message}")
 
         # 释放手动同步的执行权（若本次同步由 _on_start_sync 发起）
         if self.scheduler and getattr(self, "_manual_sync_task_id", None):
@@ -1506,7 +1507,7 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 failed_files = []
 
-        # 有失败文件时弹出提示
+        # 有失败文件时记录日志（需求：不再弹窗打扰）
         if failed_files and not is_cancelled:
             task_name = ""
             if self.scheduler:
@@ -1520,23 +1521,26 @@ class MainWindow(QMainWindow):
                 failed_files=failed_files,
             )
         elif error and not is_cancelled:
-            # 任务执行异常（非文件级失败），单独弹窗
+            # 任务执行异常（非文件级失败）：仅记日志，不再弹窗
             task_name = ""
             if self.scheduler:
                 task = self.scheduler.get_task(task_id)
                 if task:
                     task_name = task.name
             title = f"任务 '{task_name or task_id}' 执行失败" if task_name else "任务执行失败"
-            QMessageBox.warning(self, title, error)
+            self.logger.error(f"{title}: {error}")
 
         # 刷新UI（安全：在 GUI 线程）
         self._refresh_task_list()
 
     def _show_failed_files_dialog(self, title: str, intro: str, failed_files):
-        """弹出对话框展示失败文件清单及原因
+        """记录失败文件清单及原因到日志（不再弹窗打扰用户）
+
+        需求：同步报错不弹窗提醒，保留日志记录即可。完整明细写入日志，
+        用户可在「日志」窗口查看。
 
         Args:
-            title: 对话框标题
+            title: 日志标题
             intro: 引言文本
             failed_files: 失败文件列表，每个元素为 dict {
                 path, action, reason, local_path, remote_path
@@ -1545,7 +1549,7 @@ class MainWindow(QMainWindow):
         if not failed_files:
             return
 
-        # 限制展示数量，避免列表过长
+        # 限制展示数量，避免日志过长
         max_show = 20
         shown = failed_files[:max_show]
         more_count = len(failed_files) - len(shown)
@@ -1572,13 +1576,10 @@ class MainWindow(QMainWindow):
             lines.append("")
             lines.append(f"... 还有 {more_count} 个失败文件未展示，请查看日志获取完整列表。")
 
-        lines.append("")
-        lines.append("完整失败明细已写入日志，可在「日志」窗口查看。")
-
         detail = "\n".join(lines)
 
-        self.logger.error(f"同步失败明细:\n{detail}")
-        QMessageBox.warning(self, title, detail)
+        # 仅记录日志，不弹窗
+        self.logger.error(f"{title}:\n{detail}")
 
     def _save_tasks(self):
         """保存任务列表"""

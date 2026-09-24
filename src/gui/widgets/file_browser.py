@@ -13,7 +13,7 @@ import threading
 
 from ...models.sync_task import SyncTask
 from ...models.file_info import FileInfo
-from ...utils.icon_utils import get_file_icon
+from ...utils.icon_utils import get_file_icon, get_file_type_sort_key
 from ...utils.file_utils import FileUtils
 
 
@@ -98,7 +98,7 @@ class FileBrowserWidget(QWidget):
         local_layout.addWidget(local_label)
 
         self.local_tree = QTreeWidget()
-        self.local_tree.setHeaderLabels(["名称", "大小", "修改时间"])
+        self.local_tree.setHeaderLabels(["名称(类型)", "大小", "修改时间"])
         self.local_tree.setAlternatingRowColors(True)  # 启用交替行颜色
         self.local_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
         self.local_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -108,8 +108,10 @@ class FileBrowserWidget(QWidget):
         self.local_tree.itemSelectionChanged.connect(self._on_local_selection_changed)
         # 表头点击排序：点击标题按该列手动排序（不使用 Qt 自动排序，因为
         # 自动排序按文本比较且不保证"文件夹优先"，大小/时间列无法正确比较）
+        # 默认按"名称(类型)"列排序：先按文件类型分组，组内再按名称。
         self.local_tree.header().setSectionsClickable(True)
         self.local_tree.header().setSortIndicatorShown(True)
+        self.local_tree.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.local_tree.header().sectionClicked.connect(self._on_local_header_clicked)
         local_layout.addWidget(self.local_tree)
 
@@ -125,7 +127,7 @@ class FileBrowserWidget(QWidget):
         remote_layout.addWidget(remote_label)
 
         self.remote_tree = QTreeWidget()
-        self.remote_tree.setHeaderLabels(["名称", "大小", "修改时间"])
+        self.remote_tree.setHeaderLabels(["名称(类型)", "大小", "修改时间"])
         self.remote_tree.setAlternatingRowColors(True)  # 启用交替行颜色
         self.remote_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
         self.remote_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -135,8 +137,10 @@ class FileBrowserWidget(QWidget):
         self.remote_tree.itemSelectionChanged.connect(self._on_remote_selection_changed)
         # 表头点击排序：点击标题按该列手动排序（不使用 Qt 自动排序，因为
         # 自动排序按文本比较且不保证"文件夹优先"，大小/时间列无法正确比较）
+        # 默认按"名称(类型)"列排序：先按文件类型分组，组内再按名称。
         self.remote_tree.header().setSectionsClickable(True)
         self.remote_tree.header().setSortIndicatorShown(True)
+        self.remote_tree.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.remote_tree.header().sectionClicked.connect(self._on_remote_header_clicked)
         remote_layout.addWidget(self.remote_tree)
 
@@ -400,6 +404,9 @@ class FileBrowserWidget(QWidget):
 
                 self.local_tree.addTopLevelItem(item)
 
+            # 扫描完成后按当前排序规则重排（默认按"名称(类型)"列：类型分组 + 名称）
+            self._apply_sort(self.local_tree)
+
         except Exception as e:
             print(f"扫描本地文件失败: {e}")
 
@@ -483,6 +490,9 @@ class FileBrowserWidget(QWidget):
 
                 self.remote_tree.addTopLevelItem(item)
 
+            # 扫描完成后按当前排序规则重排（默认按"名称(类型)"列：类型分组 + 名称）
+            self._apply_sort(self.remote_tree)
+
         except Exception as e:
             print(f"扫描远程文件失败: {e}")
             self.remote_tree.clear()
@@ -541,7 +551,8 @@ class FileBrowserWidget(QWidget):
 
         - 目录始终排在文件之前（无论正序/倒序，符合文件管理器习惯）
         - 目录组、文件组内各自按排序列比较：
-          名称列用字符串比较；大小列用字节数；修改时间列用 epoch 秒
+          名称列按"文件类型分组 + 名称"排序（默认，类型相同的聚在一起）；
+          大小列用字节数；修改时间列用 epoch 秒
         - 升序/降序由表头的排序指示器方向决定
         """
         sort_col = tree.header().sortIndicatorSection()
@@ -550,9 +561,9 @@ class FileBrowserWidget(QWidget):
         def _field_key(item: QTreeWidgetItem):
             """按排序列提取排序键
 
-            排序键统一存储为数值（大小字节数、修改时间 epoch 秒），
-            避免 PyQt6 对 datetime 等类型的转换导致比较时崩溃。
-            未设置数据的 item.data() 在 PyQt6 中返回 None/无效值，
+            排序键统一存储为可比较类型（大小/时间用数值；名称用
+            (类型序号, 名称小写) 元组），避免 PyQt6 对 datetime 等类型的转换
+            导致比较时崩溃。未设置数据的 item.data() 在 PyQt6 中返回 None/无效值，
             这里一律用 isinstance 做类型检查，非目标类型时走回退逻辑。
             """
             if sort_col == 1:
@@ -569,8 +580,9 @@ class FileBrowserWidget(QWidget):
                     return float(raw)
                 return float("-inf")
             else:
-                # 名称（列0）
-                return item.text(0)
+                # 名称（列0）：先按文件类型分组，组内按名称（返回元组，同组可比）
+                is_dir = self._is_dir_item(item)
+                return get_file_type_sort_key(item.text(0), is_dir)
 
         items = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
         dirs = [it for it in items if self._is_dir_item(it)]
