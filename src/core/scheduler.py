@@ -16,6 +16,7 @@ from .sync_engine import SyncEngine
 from .file_watcher import FileWatcher, watchdog_available
 from ..models.sync_task import SyncTask, SyncMode
 from ..models.transfer_state import TransferStatus
+from ..utils.exclude_matcher import build_matcher
 
 
 class TaskStatus(Enum):
@@ -459,11 +460,13 @@ class SyncScheduler:
             local_files = self.sync_engine.scan_local(task.local_path)
             remote_files = self.sync_engine.scan_remote(task.remote_prefix)
 
-            # 检测变更
+            # 检测变更（带任务的排除规则：命中「本地→远程」方向的路径不上传）
+            exclude_matcher = build_matcher(task)
             plan = self.sync_engine.detect_changes(
                 local_files,
                 remote_files,
-                task.sync_mode
+                task.sync_mode,
+                exclude_matcher
             )
 
             # 构造进度回调（若有注册），把进度传给 UI（通过 callback 链）

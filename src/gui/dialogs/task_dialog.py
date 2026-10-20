@@ -4,7 +4,8 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QSpinBox, QComboBox, QCheckBox,
-    QDialogButtonBox, QFormLayout, QGroupBox, QFileDialog
+    QDialogButtonBox, QFormLayout, QGroupBox, QFileDialog,
+    QPlainTextEdit
 )
 from PyQt6.QtCore import Qt
 from typing import Optional
@@ -24,7 +25,7 @@ class TaskDialog(QDialog):
         self._task = task
 
         self.setWindowTitle("新建任务" if not task else "编辑任务")
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(560, 580)
         self.setModal(True)
 
         self._init_ui()
@@ -94,6 +95,34 @@ class TaskDialog(QDialog):
 
         layout.addWidget(sync_group)
 
+        # 排除规则（.gitignore 风格）
+        exclude_group = QGroupBox("排除规则")
+        exclude_layout = QVBoxLayout(exclude_group)
+        exclude_layout.setSpacing(6)
+
+        exclude_hint = QLabel(
+            "每行一条规则，语法类似 .gitignore。命中的文件不参与「本地→远程」上传，"
+            "也不会因此删除远程；远程已有的仍可下载。"
+        )
+        exclude_hint.setWordWrap(True)
+        exclude_hint.setStyleSheet("color: #757575; font-weight: normal;")
+        exclude_layout.addWidget(exclude_hint)
+
+        self.exclude_edit = QPlainTextEdit()
+        self.exclude_edit.setPlaceholderText(
+            "示例:\n"
+            "# 注释行\n"
+            "*.log            # 任意层级的 .log 文件\n"
+            "node_modules/    # 任意层级的该目录及其内容\n"
+            "/build/          # 仅根目录下的 build 目录\n"
+            "*.tmp\n"
+            "!important.log   # 取反：重新包含"
+        )
+        self.exclude_edit.setMinimumHeight(120)
+        exclude_layout.addWidget(self.exclude_edit)
+
+        layout.addWidget(exclude_group)
+
         # 按钮
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -132,7 +161,7 @@ class TaskDialog(QDialog):
                 color: #000000;
             }
 
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QPlainTextEdit {
                 background-color: #ffffff;
                 border: 1px solid #e0e0e0;
                 border-radius: 4px;
@@ -140,7 +169,7 @@ class TaskDialog(QDialog):
                 color: #000000;
             }
 
-            QLineEdit:focus, QSpinBox:focus {
+            QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {
                 border-color: #1976d2;
             }
 
@@ -322,6 +351,9 @@ class TaskDialog(QDialog):
 
         self.enabled_check.setChecked(task.enabled)
 
+        # 排除规则（每行一条）
+        self.exclude_edit.setPlainText("\n".join(task.exclude_patterns or []))
+
     def _on_browse_local(self):
         """浏览本地路径"""
         path = QFileDialog.getExistingDirectory(
@@ -375,5 +407,9 @@ class TaskDialog(QDialog):
         task.interval = self.interval_spin.value()
         task.conflict_strategy = conflict_strategy
         task.enabled = self.enabled_check.isChecked()
+
+        # 排除规则：按行拆分，去掉空行（保留 # 注释行以便用户回看）
+        raw_lines = self.exclude_edit.toPlainText().splitlines()
+        task.exclude_patterns = [ln.strip() for ln in raw_lines if ln.strip()]
 
         return task

@@ -9,6 +9,7 @@ import logging
 from typing import Dict, Optional, Callable, Set, List
 
 from ..models.sync_task import SyncMode
+from ..utils.exclude_matcher import build_matcher
 
 try:
     from watchdog.observers import Observer
@@ -305,6 +306,16 @@ class FileWatcher:
             return
 
         rel_deleted = rel_deleted or []
+
+        # 排除规则：命中的路径不参与「本地→远程」实时同步
+        # （既不上传，也不因本地删除而删除远程对应对象）
+        matcher = build_matcher(task)
+        if matcher:
+            rel_paths = [r for r in rel_paths if not matcher.is_excluded(r)]
+            rel_deleted = [r for r in rel_deleted if not matcher.is_excluded(r)]
+            if not rel_paths and not rel_deleted:
+                self._sync_lock.release()
+                return
 
         # 仅下载模式：本地文件监听不应产生任何写远程操作（不传、不删）
         if getattr(task, "sync_mode", None) == SyncMode.DOWNLOAD:

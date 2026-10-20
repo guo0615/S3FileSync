@@ -4,7 +4,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 import uuid
 
 
@@ -36,6 +36,9 @@ class SyncTask:
     last_sync: Optional[datetime] = None        # 上次同步时间
     next_sync: Optional[datetime] = None        # 下次同步时间
     conflict_strategy: ConflictStrategy = ConflictStrategy.RENAME  # 冲突处理策略
+    # 排除规则（.gitignore 风格，每行一条）：命中「本地→远程」方向的路径不上传，
+    # 也不会因被排除而误删远程；远程已有的仍可下载回本地。
+    exclude_patterns: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         """初始化后处理"""
@@ -47,6 +50,16 @@ class SyncTask:
             self.last_sync = datetime.fromisoformat(self.last_sync)
         if isinstance(self.next_sync, str):
             self.next_sync = datetime.fromisoformat(self.next_sync)
+        # 兼容：排除规则可能以单个字符串（多行文本）形式传入
+        if self.exclude_patterns is None:
+            self.exclude_patterns = []
+        elif isinstance(self.exclude_patterns, str):
+            import re as _re
+            self.exclude_patterns = [
+                p for p in _re.split(r"[\r\n]+", self.exclude_patterns)
+            ]
+        else:
+            self.exclude_patterns = list(self.exclude_patterns)
 
     def calculate_next_sync(self) -> datetime:
         """计算下次同步时间（以当前时间为基准）
@@ -73,6 +86,7 @@ class SyncTask:
             'last_sync': self.last_sync.isoformat() if self.last_sync else None,
             'next_sync': self.next_sync.isoformat() if self.next_sync else None,
             'conflict_strategy': self.conflict_strategy.value,
+            'exclude_patterns': list(self.exclude_patterns or []),
         }
 
     @classmethod
@@ -89,4 +103,5 @@ class SyncTask:
             last_sync=datetime.fromisoformat(data['last_sync']) if data.get('last_sync') else None,
             next_sync=datetime.fromisoformat(data['next_sync']) if data.get('next_sync') else None,
             conflict_strategy=ConflictStrategy(data.get('conflict_strategy', 'rename')),
+            exclude_patterns=data.get('exclude_patterns', []) or [],
         )

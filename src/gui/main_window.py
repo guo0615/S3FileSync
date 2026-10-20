@@ -16,6 +16,7 @@ from ..core.s3_client import S3Client
 from ..core.sync_engine import SyncEngine
 from ..core.scheduler import SyncScheduler
 from ..utils.config_manager import ConfigManager
+from ..utils.exclude_matcher import build_matcher
 from .widgets.task_list import TaskListWidget
 from .widgets.file_browser import FileBrowserWidget
 from .widgets.sync_panel import SyncPanelWidget
@@ -909,12 +910,13 @@ class MainWindow(QMainWindow):
                         self.logger.debug(f"扫描远程路径: {self.task.remote_prefix}")
                         remote_files = self.sync_engine.scan_remote(self.task.remote_prefix)
 
-                        # 检测变更（以修改时间最新者作为同步源）
+                        # 检测变更（以修改时间最新者作为同步源；带任务排除规则）
                         self.progress.emit("正在检测变更...", 20, 100, 0, 0, 0)
                         plan = self.sync_engine.detect_changes(
                             local_files,
                             remote_files,
-                            self.task.sync_mode
+                            self.task.sync_mode,
+                            build_matcher(self.task)
                         )
 
                         # 执行同步

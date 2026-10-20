@@ -16,6 +16,7 @@ from ..models.sync_task import SyncTask, SyncMode, ConflictStrategy
 from ..utils.config_manager import SyncConfig
 from ..utils.file_utils import FileUtils
 from ..utils.hash_utils import HashUtils
+from ..utils.exclude_matcher import ExcludeMatcher
 
 
 class SyncCancelled(Exception):
@@ -313,7 +314,8 @@ class SyncEngine:
         self,
         local_files: Dict[str, FileInfo],
         remote_files: Dict[str, FileInfo],
-        sync_mode: SyncMode = SyncMode.BIDIRECTIONAL
+        sync_mode: SyncMode = SyncMode.BIDIRECTIONAL,
+        exclude_matcher: Optional[ExcludeMatcher] = None
     ) -> SyncPlan:
         """
         检测变更并生成同步计划
@@ -329,6 +331,8 @@ class SyncEngine:
             local_files: 本地文件字典
             remote_files: 远程文件字典
             sync_mode: 同步模式
+            exclude_matcher: 排除规则匹配器（.gitignore 风格）。命中「本地→远程」
+                方向的路径不做上传，也不会因被排除而误删远程；远程已有的仍可下载。
 
         Returns:
             同步计划
@@ -342,6 +346,10 @@ class SyncEngine:
             local_file = local_files.get(path)
             remote_file = remote_files.get(path)
 
+            # 记录本路径开始前的计划长度，便于对被排除路径做方向过滤
+            actions_before = len(plan.actions)
+            conflicts_before = len(plan.conflicts)
+
             # 根据同步模式处理
             if sync_mode == SyncMode.UPLOAD:
                 # 仅上传模式
@@ -353,10 +361,38 @@ class SyncEngine:
                 # 双向同步模式
                 self._plan_bidirectional_mode(plan, path, local_file, remote_file)
 
+            # 被排除路径：仅抑制「本地→远程」方向的动作
+            if exclude_matcher and exclude_matcher.is_excluded(path):
+                self._apply_exclusion(plan, actions_before, conflicts_before)
+
         self.logger.info(
             f"检测变更完成: {len(plan.actions)}个操作, {len(plan.conflicts)}个冲突"
         )
         return plan
+
+    @staticmethod
+    def _apply_exclusion(plan: 'SyncPlan', actions_before: int, conflicts_before: int):
+        """对被排除路径执行方向过滤
+
+        保留：下载 / 跳过；丢弃：上传 / 删除远程（避免"排除即误删远程"）；
+        冲突降级为跳过（避免冲突策略把被排除文件上传出去）。
+        """
+        kept = []
+        for idx, item in enumerate(plan.actions):
+            if idx < actions_before:
+                kept.append(item)
+                continue
+            action, local_file, remote_file = item
+            if action in (FileAction.UPLOAD, FileAction.DELETE_REMOTE):
+                continue
+            if action == FileAction.CONFLICT:
+                kept.append((FileAction.SKIP, local_file, remote_file))
+                continue
+            kept.append(item)
+        plan.actions = kept
+        # 丢弃本路径新增的冲突记录（冲突已降级为跳过）
+        if len(plan.conflicts) > conflicts_before:
+            del plan.conflicts[conflicts_before:]
 
     def _plan_upload_mode(
         self,
